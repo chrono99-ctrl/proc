@@ -1136,12 +1136,14 @@ def doblar_idioma(idioma, bloques, args, trabajo, claude, glosario, total, ganan
     log("-> Armando la pista de voz")
     pista = np.zeros(int(total * SR) + SR, dtype=np.float32)
     cursor, desfases, huecos, colocados = 0.0, 0, [], []
+    lista_desfases = []
     for i, b in enumerate(bloques):
         reg = estado[str(b["id"])]
         audio, _ = sf.read(str(trabajo / "cache_voz" / reg["wav"]), dtype="float32")
         inicio = max(b["inicio"], cursor + 0.1)
         if inicio - b["inicio"] > 1.0:
             desfases += 1
+            lista_desfases.append((b["inicio"], b["id"], inicio - b["inicio"]))
         s = int(inicio * SR)
         e = min(s + len(audio), len(pista))
         if s < len(pista):
@@ -1202,6 +1204,10 @@ def doblar_idioma(idioma, bloques, args, trabajo, claude, glosario, total, ganan
     if emerg:
         lineas += ["## Velocidad cambiada (escuchar)", ""]
         lineas += [f"- {mmss(b['inicio'])} (id {b['id']}): +{v} %" for b, v in emerg]
+        lineas.append("")
+    if lista_desfases:
+        lineas += ["## Bloques desplazados (escuchar)", ""]
+        lineas += [f"- {mmss(t)} (id {i}): +{d:.1f} s" for t, i, d in lista_desfases]
         lineas.append("")
     if huecos:
         lineas += ["## Silencios para escuchar", ""]
