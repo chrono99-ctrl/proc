@@ -96,6 +96,7 @@ jobs:
           mkdir -p trabajo/_uso preparado
           gh release download "$VIDEO" -D trabajo -p 'bloques_es.json' -p 'meta.json' --clobber
           gh release download "$VIDEO" -D preparado -p 'glosario.txt' 2>/dev/null || true
+          gh release download "$VIDEO" -D preparado -p 'titulo.txt' 2>/dev/null || true
 
       - name: Recuperar avance anterior
         if: inputs.desde_cero != 'si'
@@ -110,7 +111,8 @@ jobs:
       - name: Procesar
         run: |
           G=""; [ -f preparado/glosario.txt ] && G="--glosario preparado/glosario.txt"
-          python core.py idioma --idioma "$IDIOMA" --salida trabajo --video "$VIDEO" $G
+          T=""; [ -f preparado/titulo.txt ] && T="--titulo preparado/titulo.txt"
+          python core.py idioma --idioma "$IDIOMA" --salida trabajo --video "$VIDEO" $G $T
 
       - name: Guardar avance (también si falló)
         if: always()
@@ -125,6 +127,7 @@ jobs:
         run: |
           gh release upload "$VIDEO" trabajo/pista_voz_${IDIOMA}.flac trabajo/pista_voz_${IDIOMA}.json \
             trabajo/reporte_${IDIOMA}.md trabajo/subtitulos/*_${IDIOMA}_*.srt --clobber
+          [ -f trabajo/meta_${IDIOMA}.json ] && gh release upload "$VIDEO" trabajo/meta_${IDIOMA}.json --clobber || true
 
   paso3:
     needs: paso2

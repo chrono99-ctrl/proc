@@ -1,0 +1,52 @@
+name: Títulos
+
+on:
+  workflow_dispatch:
+    inputs:
+      video:
+        description: "Etiqueta"
+        required: true
+      idiomas:
+        description: "Códigos separados por coma"
+        default: "de,fr,ja,ru,en,pt,ar,id,vi"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: titulos-${{ inputs.video }}
+
+env:
+  VIDEO: ${{ inputs.video }}
+  GH_TOKEN: ${{ github.token }}
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  titulos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      IDIOMAS: ${{ inputs.idiomas }}
+      MOTOR: api
+      TOPE_CLAUDE_USD: "0.5"
+      USO_DIR: trabajo/_uso
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/entorno
+        with:
+          whisper: "false"
+
+      - name: Bajar título y descripción
+        run: |
+          mkdir -p trabajo/_uso preparado
+          gh release download "$VIDEO" -D preparado -p 'titulo.txt'
+          gh release download "$VIDEO" -D preparado -p 'glosario.txt' 2>/dev/null || true
+
+      - name: Traducir
+        run: |
+          G=""; [ -f preparado/glosario.txt ] && G="--glosario preparado/glosario.txt"
+          python core.py titulos --titulo preparado/titulo.txt --idiomas "$IDIOMAS" --salida trabajo $G
+
+      - name: Subir resultados
+        run: gh release upload "$VIDEO" trabajo/meta_*.json --clobber
