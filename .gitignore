@@ -1,0 +1,9 @@
+.env
+__pycache__/
+trabajo/
+entrada/
+preparado/
+*.wav
+*.mp3
+*.flac
+nube.sh

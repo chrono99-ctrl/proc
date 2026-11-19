@@ -1,0 +1,153 @@
+name: Procesar
+
+on:
+  workflow_dispatch:
+    inputs:
+      video:
+        description: "Etiqueta"
+        required: true
+      idiomas:
+        description: "Códigos separados por coma"
+        default: "de,fr,ja,ru,en,pt,ar,id,vi"
+      tope_usd:
+        description: "Tope USD por idioma"
+        default: "0.6"
+      reusar:
+        description: "si = reutilizar preparación"
+        default: "no"
+      desde_cero:
+        description: "si = sin retomar avance"
+        default: "no"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: run-${{ inputs.video }}
+
+env:
+  VIDEO: ${{ inputs.video }}
+  GH_TOKEN: ${{ github.token }}
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  paso1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      idiomas: ${{ steps.idiomas.outputs.lista }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ¿Ya está preparado?
+        id: previo
+        run: |
+          if [ "${{ inputs.reusar }}" = "si" ] && gh release view "$VIDEO" --json assets -q '.assets[].name' -R "$GITHUB_REPOSITORY" | grep -qx bloques_es.json; then
+            echo "listo=si" >> "$GITHUB_OUTPUT"; echo "Se reutilizan los bloques ya preparados"
+          fi
+
+      - uses: ./.github/actions/entorno
+        if: steps.previo.outputs.listo != 'si'
+
+      - name: Bajar entradas
+        if: steps.previo.outputs.listo != 'si'
+        run: |
+          mkdir -p entrada
+          gh release download "$VIDEO" -D entrada -p '*-cap*.wav' -p '*-cap*.txt'
+          gh release download "$VIDEO" -D entrada -p '*-cap*.json' 2>/dev/null || true
+          gh release download "$VIDEO" -D entrada -p 'glosario.txt' 2>/dev/null || true
+          echo "$(ls entrada | wc -l) archivos"
+
+      - name: Preparar
+        if: steps.previo.outputs.listo != 'si'
+        run: python core.py preparar --capitulos entrada --salida trabajo --video "$VIDEO"
+
+      - name: Subir preparación
+        if: steps.previo.outputs.listo != 'si'
+        run: gh release upload "$VIDEO" trabajo/bloques_es.json trabajo/meta.json trabajo/subtitulos/*.srt --clobber
+
+      - id: idiomas
+        run: python3 -c "import json,os; print('lista='+json.dumps([x.strip() for x in os.environ['L'].split(',') if x.strip()]))" >> "$GITHUB_OUTPUT"
+        env:
+          L: ${{ inputs.idiomas }}
+
+  paso2:
+    needs: paso1
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        idioma: ${{ fromJSON(needs.paso1.outputs.idiomas) }}
+    env:
+      IDIOMA: ${{ matrix.idioma }}
+      MOTOR: api
+      TOPE_CLAUDE_USD: ${{ inputs.tope_usd }}
+      USO_DIR: trabajo/_uso
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      AZURE_SPEECH_KEY: ${{ secrets.AZURE_SPEECH_KEY }}
+      AZURE_SPEECH_REGION: ${{ secrets.AZURE_SPEECH_REGION }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/entorno
+
+      - name: Bajar preparación
+        run: |
+          mkdir -p trabajo/_uso preparado
+          gh release download "$VIDEO" -D trabajo -p 'bloques_es.json' -p 'meta.json' --clobber
+          gh release download "$VIDEO" -D preparado -p 'glosario.txt' 2>/dev/null || true
+
+      - name: Recuperar avance anterior
+        if: inputs.desde_cero != 'si'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            trabajo/_trabajo
+            trabajo/_uso
+          key: avance-${{ inputs.video }}-${{ matrix.idioma }}-${{ github.run_id }}
+          restore-keys: avance-${{ inputs.video }}-${{ matrix.idioma }}-
+
+      - name: Procesar
+        run: |
+          G=""; [ -f preparado/glosario.txt ] && G="--glosario preparado/glosario.txt"
+          python core.py idioma --idioma "$IDIOMA" --salida trabajo --video "$VIDEO" $G
+
+      - name: Guardar avance (también si falló)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            trabajo/_trabajo
+            trabajo/_uso
+          key: avance-${{ inputs.video }}-${{ matrix.idioma }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Subir resultados
+        run: |
+          gh release upload "$VIDEO" trabajo/pista_voz_${IDIOMA}.flac trabajo/pista_voz_${IDIOMA}.json \
+            trabajo/reporte_${IDIOMA}.md trabajo/subtitulos/*_${IDIOMA}_*.srt --clobber
+
+  paso3:
+    needs: paso2
+    if: always() && needs.paso2.result != 'cancelled'
+    uses: ./.github/workflows/final.yml
+    with:
+      video: ${{ inputs.video }}
+      opcional: true
+
+  aviso:
+    needs: [paso1, paso2, paso3]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Aviso
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          pip install -q requests
+          mkdir -p reportes
+          gh release download "$VIDEO" -D reportes -p 'reporte_*.md' --clobber 2>/dev/null || true
+          IDIOMAS='${{ needs.paso1.result == 'success' && inputs.idiomas || '' }}'
+          python notify.py --video "$VIDEO" --etapa principal --resultado "${{ needs.paso2.result }}" \
+            --idiomas "$IDIOMAS" --mezcla "${{ needs.paso3.outputs.mezclado == 'si' && 'success' || 'skipped' }}" \
+            --carpeta reportes

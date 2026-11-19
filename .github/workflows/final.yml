@@ -1,0 +1,82 @@
+name: Paso final
+
+on:
+  workflow_dispatch:
+    inputs:
+      video:
+        description: "Etiqueta"
+        required: true
+  workflow_call:
+    inputs:
+      video:
+        type: string
+        required: true
+      opcional:
+        description: "true = si todavía no hay fondo.wav, termina sin error"
+        type: boolean
+        default: false
+    outputs:
+      mezclado:
+        description: "si = se hicieron los MP3"
+        value: ${{ jobs.final.outputs.mezclado }}
+
+permissions:
+  contents: write
+
+env:
+  VIDEO: ${{ inputs.video }}
+  GH_TOKEN: ${{ github.token }}
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  final:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      mezclado: ${{ steps.listo.outputs.mezclado }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ¿Ya está el fondo?
+        id: fondo
+        run: |
+          if gh release view "$VIDEO" --json assets -q '.assets[].name' | grep -qx 'fondo.wav'; then
+            echo "hay=si" >> "$GITHUB_OUTPUT"
+          elif [ "${{ inputs.opcional }}" = "true" ]; then
+            echo "hay=no" >> "$GITHUB_OUTPUT"
+            echo "::notice::Todavía no hay fondo.wav: las pistas de voz quedaron listas. Cuando exportes el fondo: bash nube.sh fondo $VIDEO RUTA/fondo.wav"
+          else
+            echo "::error::No hay fondo.wav en el Release $VIDEO"; exit 1
+          fi
+
+      - uses: ./.github/actions/entorno
+        if: steps.fondo.outputs.hay == 'si'
+        with:
+          whisper: "false"
+
+      - name: Bajar fondo y pistas
+        if: steps.fondo.outputs.hay == 'si'
+        run: |
+          mkdir -p trabajo
+          gh release download "$VIDEO" -D trabajo -p 'fondo.wav' -p 'meta.json' -p 'pista_voz_*' --clobber
+
+      - name: Combinar
+        if: steps.fondo.outputs.hay == 'si'
+        run: python core.py mezclar --fondo trabajo/fondo.wav --salida trabajo --video "$VIDEO"
+
+      - name: Subir los MP3 al Release
+        if: steps.fondo.outputs.hay == 'si'
+        run: gh release upload "$VIDEO" trabajo/${VIDEO}_*.mp3 --clobber
+
+      - id: listo
+        if: steps.fondo.outputs.hay == 'si'
+        run: echo "mezclado=si" >> "$GITHUB_OUTPUT"
+
+      - name: Aviso al teléfono
+        if: always() && !inputs.opcional
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          pip install -q requests 2>/dev/null || true
+          mkdir -p trabajo
+          python notify.py --video "$VIDEO" --etapa final --resultado "${{ job.status }}" --carpeta trabajo

@@ -1,0 +1,50 @@
+name: Entorno
+description: ffmpeg, Python, whisper.cpp (compilado y guardado en caché) y el modelo de Whisper.
+inputs:
+  whisper:
+    description: "true si este paso necesita Whisper"
+    default: "true"
+runs:
+  using: composite
+  steps:
+    - name: ffmpeg
+      shell: bash
+      run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg > /dev/null && ffmpeg -hide_banner -filters | grep -q aexciter
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+        cache: pip
+
+    - name: Paquetes de Python
+      shell: bash
+      run: pip install -q -r requirements.txt
+
+    - name: Caché de whisper.cpp + modelo
+      if: inputs.whisper == 'true'
+      id: cache-whisper
+      uses: actions/cache@v4
+      with:
+        path: ~/whisper
+        key: whisper-v1.7.6-large-v3-turbo-q5_0-static-avx2
+
+    - name: Compilar whisper.cpp y bajar el modelo (solo la primera vez)
+      if: inputs.whisper == 'true' && steps.cache-whisper.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        git clone -q --depth 1 --branch v1.7.6 https://github.com/ggml-org/whisper.cpp ~/whisper
+        cd ~/whisper
+        cmake -B build -DBUILD_SHARED_LIBS=OFF -DWHISPER_BUILD_TESTS=OFF -DGGML_NATIVE=OFF \
+              -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DCMAKE_BUILD_TYPE=Release > /dev/null
+        cmake --build build -j --config Release --target whisper-cli > /dev/null
+        mkdir -p models
+        curl -sSL -o models/ggml-large-v3-turbo-q5_0.bin \
+          https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
+        ls -la build/bin/whisper-cli models/
+
+    - name: Rutas de Whisper
+      if: inputs.whisper == 'true'
+      shell: bash
+      run: |
+        echo "WHISPER_DIR=$HOME/whisper" >> "$GITHUB_ENV"
+        echo "WHISPER_MODELO=$HOME/whisper/models/ggml-large-v3-turbo-q5_0.bin" >> "$GITHUB_ENV"

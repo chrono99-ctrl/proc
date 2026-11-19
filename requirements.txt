@@ -1,0 +1,7 @@
+numpy
+soundfile
+requests
+python-dotenv
+jiwer
+edge-tts
+anthropic
