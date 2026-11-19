@@ -18,6 +18,9 @@ on:
       desde_cero:
         description: "si = sin retomar avance"
         default: "no"
+      solo_titulos:
+        description: "si = solo traducir título y descripción (sin voz ni mezcla)"
+        default: "no"
 
 permissions:
   contents: write
@@ -31,7 +34,38 @@ env:
   PYTHONUNBUFFERED: "1"
 
 jobs:
+  titulos:
+    if: inputs.solo_titulos == 'si'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      IDIOMAS: ${{ inputs.idiomas }}
+      MOTOR: api
+      TOPE_CLAUDE_USD: "0.5"
+      USO_DIR: trabajo/_uso
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/entorno
+        with:
+          whisper: "false"
+
+      - name: Bajar título y descripción
+        run: |
+          mkdir -p trabajo/_uso preparado
+          gh release download "$VIDEO" -D preparado -p 'titulo.txt'
+          gh release download "$VIDEO" -D preparado -p 'glosario.txt' 2>/dev/null || true
+
+      - name: Traducir
+        run: |
+          G=""; [ -f preparado/glosario.txt ] && G="--glosario preparado/glosario.txt"
+          python core.py titulos --titulo preparado/titulo.txt --idiomas "$IDIOMAS" --salida trabajo $G
+
+      - name: Subir resultados
+        run: gh release upload "$VIDEO" trabajo/meta_*.json --clobber
+
   paso1:
+    if: inputs.solo_titulos != 'si'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     outputs:
@@ -131,7 +165,7 @@ jobs:
 
   paso3:
     needs: paso2
-    if: always() && needs.paso2.result != 'cancelled'
+    if: always() && inputs.solo_titulos != 'si' && needs.paso2.result != 'cancelled'
     uses: ./.github/workflows/final.yml
     with:
       video: ${{ inputs.video }}
@@ -139,7 +173,7 @@ jobs:
 
   aviso:
     needs: [paso1, paso2, paso3]
-    if: always()
+    if: always() && inputs.solo_titulos != 'si'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
