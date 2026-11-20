@@ -32,6 +32,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -710,6 +711,147 @@ No uses herramientas. Devuelve SOLO un JSON: {{"ok": true/false, "problema": "<e
                 "se_entiende_en_espanol": ""}
 
 
+# ---------------------------------------------------------------- título y descripción por idioma
+
+MAX_TITULO = 100          # límites de la plataforma de destino
+MAX_DESCRIPCION = 5000    # bytes UTF-8 (no caracteres)
+RE_ENLACE = re.compile(r"https?://[^\s<>]+")
+RE_MARCA = re.compile(r"(?<![\d:])\d{1,2}:\d{2}(?::\d{2})?(?![\d:])")
+RE_HASHTAG = re.compile(r"#\w+")
+
+SISTEMA_META = """Traduces el título y la descripción de un video de divulgación del español al {idioma}.
+Reglas:
+- Suena natural, como lo escribiría un creador nativo. El título es claro y atractivo, de {max_titulo} caracteres como máximo.
+- Conserva EXACTAMENTE, sin traducir ni modificar: los enlaces (http...), las marcas de tiempo (0:00, 12:34, 1:02:03) y los hashtags (#algo).
+- Conserva los saltos de línea y las líneas en blanco: cada línea del original sigue siendo una línea. En una lista de capítulos traduce solo el texto que sigue a la marca de tiempo.
+- Nunca uses los signos < ni >.
+- La descripción no puede pasar de 5000 bytes en UTF-8 (en japonés, ruso o árabe cada carácter pesa 2 o 3 bytes): si hace falta, resume el texto, nunca los enlaces, las marcas de tiempo ni los hashtags.
+- No agregues ni quites información. Sin notas ni comentarios.
+- No uses herramientas ni archivos: responde directamente.
+- Devuelve SOLO un JSON: {{"title": "<título>", "description": "<descripción>"}}"""
+
+
+def leer_titulo(ruta):
+    """titulo.txt: línea 1 = título en español; desde la línea 3 = descripción. None si no hay o está vacío."""
+    if not ruta or not Path(ruta).exists():
+        return None
+    lineas = Path(ruta).read_text("utf-8-sig").splitlines()
+    titulo = lineas[0].strip() if lineas else ""
+    if not titulo:
+        return None
+    return {"title": titulo, "description": "\n".join(lineas[2:]).strip()}
+
+
+def _enlaces(texto):
+    return {u.rstrip(".,;:!?)»\"'") for u in RE_ENLACE.findall(texto)}
+
+
+def problemas_meta(origen, meta):
+    """Lista de problemas de una traducción de título/descripción (vacía = está bien)."""
+    t, d = meta["title"], meta["description"]
+    p = []
+    if not t.strip():
+        p.append("el título quedó vacío")
+    if len(t) > MAX_TITULO:
+        p.append(f"el título tiene {len(t)} caracteres (máximo {MAX_TITULO})")
+    if len(d.encode("utf-8")) > MAX_DESCRIPCION:
+        p.append(f"la descripción pesa {len(d.encode('utf-8'))} bytes en UTF-8 (máximo {MAX_DESCRIPCION}): "
+                 "acórtala resumiendo el texto, sin tocar enlaces, marcas de tiempo ni hashtags")
+    if "<" in t + d or ">" in t + d:
+        p.append("hay signos < o >")
+    ori, tra = origen["title"] + "\n" + origen["description"], t + "\n" + d
+    p += [f"falta el enlace {u}" for u in sorted(_enlaces(ori)) if u not in tra]
+    faltan = Counter(RE_MARCA.findall(ori)) - Counter(RE_MARCA.findall(tra))
+    p += [f"falta la marca de tiempo {m}" for m in faltan]
+    faltan = Counter(RE_HASHTAG.findall(ori)) - Counter(RE_HASHTAG.findall(tra))
+    p += [f"falta el hashtag {h}" for h in faltan]
+    lineas = lambda x: len([l for l in x.splitlines() if l.strip()])
+    if lineas(d) != lineas(origen["description"]):
+        p.append(f"la descripción tiene {lineas(d)} líneas y el original {lineas(origen['description'])}")
+    return p
+
+
+def _recortar(texto, limite, en_bytes=False):
+    """Último recurso: corta en un espacio o salto de línea (en bytes UTF-8 si en_bytes)."""
+    medida = (lambda t: len(t.encode("utf-8"))) if en_bytes else len
+    if medida(texto) <= limite:
+        return texto
+    corte = texto
+    while medida(corte + "…") > limite:
+        corte = corte[:-1]
+    pos = max(corte.rfind(" "), corte.rfind("\n"))
+    if pos > len(corte) // 2:
+        corte = corte[:pos]
+    return corte.rstrip() + "…"
+
+
+def _recortar_descripcion(texto):
+    """Último recurso para pasar de MAX_DESCRIPCION bytes: quita párrafos de texto desde el final y nunca
+    las líneas con enlaces, marcas de tiempo, hashtags ni encabezados que terminan en dos puntos."""
+    lineas = texto.split("\n")
+    protegida = lambda l: (RE_ENLACE.search(l) or RE_MARCA.search(l) or RE_HASHTAG.search(l)
+                           or l.rstrip().endswith((":", "：")))     # encabezados como "Capítulos:"
+    while len("\n".join(lineas).encode("utf-8")) > MAX_DESCRIPCION:
+        for i in range(len(lineas) - 1, -1, -1):
+            if lineas[i].strip() and not protegida(lineas[i]):
+                del lineas[i]
+                break
+        else:
+            break
+    texto = re.sub(r"\n{3,}", "\n\n", "\n".join(lineas)).strip()
+    return _recortar(texto, MAX_DESCRIPCION, en_bytes=True)      # solo actúa si aún se pasa
+
+
+def traducir_meta(claude, origen, idioma, glosario):
+    """Devuelve (meta, avisos). Reintenta con los problemas encontrados; el título largo se recorta al final."""
+    nombre = NOMBRES.get(idioma, idioma)
+    sistema = SISTEMA_META.format(idioma=nombre, max_titulo=MAX_TITULO)
+    if glosario:
+        sistema += f"\n\nGlosario / contexto del video:\n{glosario}"
+    entrada = json.dumps(origen, ensure_ascii=False)
+    meta, probs, aviso = None, ["no se obtuvo traducción"], ""
+    for _ in range(3):
+        try:
+            r = extraer_json(claude.pedir(sistema + aviso, entrada, max_tokens=16000))
+            meta = {"title": " ".join(str(r["title"]).split()).replace("<", "").replace(">", ""),
+                    "description": str(r["description"]).strip().replace("<", "").replace(">", "")}
+        except Exception:            # respuesta vacía, JSON roto, error de red: se reintenta
+            continue
+        probs = problemas_meta(origen, meta)
+        if not probs:
+            return meta, []
+        aviso = "\n\nEn tu intento anterior hubo estos problemas; corrígelos: " + "; ".join(probs)
+    if meta is None:
+        return {"title": "", "description": ""}, probs
+    avisos = []
+    titulo = _recortar(meta["title"], MAX_TITULO)
+    if titulo != meta["title"]:
+        avisos.append(f"título recortado de {len(meta['title'])} a {len(titulo)} caracteres")
+    descr = _recortar_descripcion(meta["description"])
+    if descr != meta["description"]:
+        avisos.append(f"descripción recortada de {len(meta['description'].encode('utf-8'))} a "
+                      f"{len(descr.encode('utf-8'))} bytes quitando párrafos de texto; se conservaron enlaces, marcas de tiempo y hashtags (revisa)")
+    meta["title"], meta["description"] = titulo, descr
+    return meta, avisos + problemas_meta(origen, meta)
+
+
+def generar_meta(claude, idioma, origen, glosario, salida, cache):
+    """Traduce título y descripción a meta_XX.json (con caché: si el original no cambió, no se paga de nuevo)."""
+    ruta_cache = cache / "titulo.json"
+    hecho = leer_json(ruta_cache)
+    if hecho is None or hecho.get("origen") != origen:
+        log("-> Título y descripción")
+        meta, avisos = traducir_meta(claude, origen, idioma, glosario)
+        hecho = {"origen": origen, "meta": meta, "avisos": avisos}
+        if meta["title"]:               # un fallo total no se guarda: un retomar lo vuelve a intentar
+            guardar_json(ruta_cache, hecho)
+    for a in hecho["avisos"]:
+        log(f"!! título/descripción ({idioma}): {a}")
+    if hecho["meta"]["title"]:
+        guardar_json(Path(salida) / f"meta_{idioma}.json", hecho["meta"])
+    return hecho["avisos"]
+
+
 # ---------------------------------------------------------------- contador mensual y ritmo de la voz
 
 def caracteres_facturables(texto):
@@ -994,12 +1136,14 @@ def doblar_idioma(idioma, bloques, args, trabajo, claude, glosario, total, ganan
     log("-> Armando la pista de voz")
     pista = np.zeros(int(total * SR) + SR, dtype=np.float32)
     cursor, desfases, huecos, colocados = 0.0, 0, [], []
+    lista_desfases = []
     for i, b in enumerate(bloques):
         reg = estado[str(b["id"])]
         audio, _ = sf.read(str(trabajo / "cache_voz" / reg["wav"]), dtype="float32")
         inicio = max(b["inicio"], cursor + 0.1)
         if inicio - b["inicio"] > 1.0:
             desfases += 1
+            lista_desfases.append((b["inicio"], b["id"], inicio - b["inicio"]))
         s = int(inicio * SR)
         e = min(s + len(audio), len(pista))
         if s < len(pista):
@@ -1060,6 +1204,10 @@ def doblar_idioma(idioma, bloques, args, trabajo, claude, glosario, total, ganan
     if emerg:
         lineas += ["## Velocidad cambiada (escuchar)", ""]
         lineas += [f"- {mmss(b['inicio'])} (id {b['id']}): +{v} %" for b, v in emerg]
+        lineas.append("")
+    if lista_desfases:
+        lineas += ["## Bloques desplazados (escuchar)", ""]
+        lineas += [f"- {mmss(t)} (id {i}): +{d:.1f} s" for t, i, d in lista_desfases]
         lineas.append("")
     if huecos:
         lineas += ["## Silencios para escuchar", ""]
@@ -1156,7 +1304,36 @@ def cmd_idioma(args):
     if claude.motor == "api":
         log(f"Claude: API ({MODELO_TRADUCCION} traduce, {MODELO_AJUSTE} reescribe y revisa). "
             f"Tope de este idioma: {claude.uso.tope:.2f} USD (gastado: {claude.uso.total:.2f}).")
+    origen = leer_titulo(args.titulo)
+    avisos_meta = None
+    if origen:                       # sin titulo.txt se salta; un fallo aquí no detiene el doblaje
+        try:
+            (trabajo / args.idioma).mkdir(exist_ok=True)
+            avisos_meta = generar_meta(claude, args.idioma, origen, glosario, salida, trabajo / args.idioma)
+        except (Exception, SystemExit) as e:    # SystemExit: si la API falla, el doblaje lo dirá con su propio mensaje
+            avisos_meta = [f"no se pudo traducir ({type(e).__name__}); el doblaje sigue"]
+            log(f"!! título/descripción ({args.idioma}): {avisos_meta[0]}")
     doblar_idioma(args.idioma, bloques, args, trabajo, claude, glosario, meta["duracion"], meta["ganancia_ref"])
+    if avisos_meta is not None:
+        with open(salida / f"reporte_{args.idioma}.md", "a", encoding="utf-8") as f:
+            f.write("\n\n## Título y descripción\n\n" +
+                    ("\n".join(f"- Aviso: {a}" for a in avisos_meta) if avisos_meta else "- Traducidos sin problemas.") + "\n")
+
+
+def cmd_titulos(args):
+    """Solo título y descripción de cada idioma (videos ya doblados): no toca voz ni pistas."""
+    origen = leer_titulo(args.titulo)
+    if origen is None:
+        sys.exit("No hay titulo.txt (o está vacío): línea 1 = título, desde la línea 3 = descripción.")
+    salida = Path(args.salida)
+    glosario = Path(args.glosario).read_text("utf-8") if args.glosario and Path(args.glosario).exists() else ""
+    claude = Claude()
+    for idioma in [x.strip() for x in args.idiomas.split(",") if x.strip()]:
+        cache = salida / "_trabajo" / idioma
+        cache.mkdir(parents=True, exist_ok=True)
+        avisos = generar_meta(claude, idioma, origen, glosario, salida, cache)
+        log(f"{idioma}: {'OK' if not avisos else str(len(avisos)) + ' aviso(s)'}")
+    log(f"Costo de la API: {claude.medidor.total:.3f} USD")
 
 
 def cmd_mezclar(args):
@@ -1247,6 +1424,12 @@ def main():
     b.add_argument("--salida", required=True)
     b.add_argument("--video", required=True)
     b.add_argument("--glosario", help="archivo .txt opcional con nombres propios y contexto del video")
+    b.add_argument("--titulo", help="titulo.txt opcional: se traduce a meta_XX.json")
+    t = sub.add_parser("titulos")
+    t.add_argument("--titulo", required=True)
+    t.add_argument("--idiomas", required=True)
+    t.add_argument("--salida", required=True)
+    t.add_argument("--glosario")
     c = sub.add_parser("mezclar")
     c.add_argument("--fondo", required=True)
     c.add_argument("--salida", required=True)
@@ -1254,7 +1437,8 @@ def main():
     args = p.parse_args()
     if args.comando == "idioma" and (not WHISPER_CLI.exists() or not WHISPER_MODELO.exists()):
         sys.exit(f"No encuentro whisper-cli ({WHISPER_CLI}) o el modelo ({WHISPER_MODELO})")
-    {"preparar": cmd_preparar, "idioma": cmd_idioma, "mezclar": cmd_mezclar}[args.comando](args)
+    {"preparar": cmd_preparar, "idioma": cmd_idioma, "titulos": cmd_titulos,
+     "mezclar": cmd_mezclar}[args.comando](args)
 
 
 if __name__ == "__main__":
